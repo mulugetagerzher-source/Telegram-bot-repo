@@ -1,1 +1,1 @@
-web: python relay.py
+web: python main.py
