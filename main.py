@@ -11,6 +11,7 @@ mbreciept.cbe.com.et ን በምትኩ ይጠይቃል (ሰርቨሩ ኢትዮጵ
 """
 import io
 import re
+from urllib.parse import urlsplit, urlunsplit
 
 import pdfplumber
 import requests
@@ -55,15 +56,30 @@ def extract_tele_receipt_data(tid: str) -> dict:
 # ==========================================================================
 CBE_MASKED_ACCOUNT_RE = r"\b[A-Za-z0-9]\*{2,}\d+\b"
 CBE_REMAINING_LABELS = [
+    ("payment_type", r"Payment\s*Type"),
     ("date", r"Payment\s*Date\s*&\s*Time"),
     ("reference", r"Reference\s*No\.?\s*\(VAT\s*Invoice\s*No\)"),
     ("reason", r"Reason\s*/\s*Type\s*of\s*service"),
     ("transferred_amount", r"Transferred\s*Amount"),
-    ("commission", r"Commission\s*or\s*Service\s*Charge"),
-    ("vat_on_commission", r"15%\s*VAT\s*on\s*Commission"),
-    ("total_paid", r"Total\s*amount\s*debited\s*from\s*customers?\s*account"),
+    ("commission", r"Service\s*Charge\s*:?"),
+    ("vat_on_commission", r"VAT\s*\(15%\s*of\s*service\s*charge\)"),
+    ("disaster_recovery", r"Disaster\s*Risk\s*Response\s*Fund\s*\(5%\s*of\s*service\s*charge\)"),
+    ("total_paid", r"Total\s*amount\s*debited\s*from\s*customer'?s?\s*account"),
     ("amount_in_word", r"Amount\s*in\s*Word"),
 ]
+
+
+def _normalize_cbe_url(url: str) -> str:
+    """CBE ሰርቨር/CDN hostname ላይ ፊደል-ስሜታዊ (case-sensitive) ሊሆን ስለሚችል
+    (ለምሳሌ 'Mbreciept.cbe.com.et' 404 ሲመልስ 'mbreciept.cbe.com.et' ግን ይሰራል)፣
+    ዶሜይኑን ብቻ ወደ ትንሽ ፊደል እንቀይራለን — path/token ግን እንዳለ እንተወዋለን።"""
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, parts.query, parts.fragment))
+
+
+def _extract_cbe_status(text: str) -> str:
+    m = re.search(r"Status\s*:?\s*\n?\s*([A-Za-z]{3,})", text, re.I)
+    return m.group(1).strip().upper() if m else ""
 
 
 def _extract_cbe_pdf_fields(text: str) -> dict:
@@ -74,12 +90,16 @@ def _extract_cbe_pdf_fields(text: str) -> dict:
     text = re.sub(r"[ \t]+", " ", text)
     data: dict = {}
 
+    status = _extract_cbe_status(text)
+    if status:
+        data["status"] = status
+
     account_matches = list(re.finditer(CBE_MASKED_ACCOUNT_RE, text))
-    payer_m = re.search(r"Payer", text, re.I)
-    receiver_m = re.search(r"Receiver", text, re.I)
+    payer_m = re.search(r"Payer\s*:?", text, re.I)
+    receiver_m = re.search(r"Receiver\s*:?", text, re.I)
 
     def _clean_name(raw_name: str) -> str:
-        raw_name = re.sub(r"\s*Account\s*$", "", raw_name, flags=re.I)
+        raw_name = re.sub(r"\s*Account\s*:?\s*$", "", raw_name, flags=re.I)
         return raw_name.strip(" \n\t:-")
 
     if payer_m and account_matches:
@@ -108,6 +128,7 @@ def _extract_cbe_pdf_fields(text: str) -> dict:
 
 
 def extract_cbe_receipt_data(url: str) -> dict:
+    url = _normalize_cbe_url(url)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     resp = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
     resp.raise_for_status()
