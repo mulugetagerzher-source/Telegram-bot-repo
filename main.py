@@ -141,48 +141,57 @@ def _extract_cbe_pdf_fields(text: str) -> dict:
     return data
 
 
-def extract_cbe_receipt_data(id_str: str) -> dict:
-    id_str = id_str.strip().upper()
-    url = f"https://apps.cbe.com.et:100/?id={id_str}"
+def extract_cbe_receipt_data(url: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    resp = requests.get(url, headers=headers, timeout=25)
+    resp = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
     resp.raise_for_status()
 
-    content_type = resp.headers.get("Content-Type", "")
-    if "pdf" not in content_type.lower() and not resp.content.startswith(b"%PDF"):
-        # ልክ ያልሆነ reference/account ሲላክ CBE ብዙ ጊዜ PDF ፋንታ የስህተት ገጽ ይመልሳል
-        return {}
+    content_type = resp.headers.get("Content-Type", "").lower()
 
-    text = ""
-    with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-        for page in pdf.pages:
-            text += (page.extract_text() or "") + "\n"
+    if "pdf" in content_type or resp.content.startswith(b"%PDF"):
+        text = ""
+        with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+            for page in pdf.pages:
+                text += (page.extract_text() or "") + "\n"
+        return _extract_cbe_pdf_fields(text)
 
-    return _extract_cbe_pdf_fields(text)
+    # PDF ካልሆነ (ለምሳሌ mbreciept.cbe.com.et አንዳንዴ HTML ገጽ ሊመልስ ይችላል) —
+    # ተመሳሳይ labels ስላሉት ጽሁፉን ከ HTML ላይ አውጥተን በዚያው field-parser እናልፍበታለን
+    if "html" in content_type or resp.text.strip().startswith("<"):
+        soup = BeautifulSoup(resp.text, "html.parser")
+        text = soup.get_text(separator="\n")
+        return _extract_cbe_pdf_fields(text)
+
+    # ልክ ያልሆነ reference/account ሲላክ CBE ብዙ ጊዜ ያልታወቀ/ባዶ ምላሽ ይመልሳል
+    return {}
 
 
 def _parse_cbe_input(raw: str):
-    """ተጠቃሚው ከላከው ጽሁፍ CBE-verification id (reference+account suffix) ለማውጣት ይሞክራል።
-    ሦስት አይነት ግቤቶችን ይደግፋል፦
-      1) ሙሉ URL: https://apps.cbe.com.et:100/?id=FT....12345678
-      2) ብቻውን የተላከ ID string (reference+suffix ተጣምረው): FT....12345678
+    """ተጠቃሚው ከላከው ጽሁፍ የ CBE ደረሰኝ verification URL ለማውጣት ይሞክራል።
+    አራት አይነት ግቤቶችን ይደግፋል፦
+      1) ማንኛውም *.cbe.com.et ደረሰኝ ሊንክ (ለምሳሌ apps.cbe.com.et:100/?id=... ወይም
+         mbreciept.cbe.com.et/v2-... የመሳሰሉ የተለያዩ ቅርጾች ሊኖሩት ይችላሉ — CBE ራሱ
+         ከጊዜ ወደ ጊዜ ቅርጹን ስለሚቀይር domain/path ላይ ብቻ ሳንወሰን ማንኛውንም cbe.com.et
+         ሊንክ እንይዛለን)
+      2) ብቻውን የተላከ ID string (reference+account suffix ተጣምረው): FT....12345678
       3) reference እና account suffix በክፍተት ተለያይተው: FT.... 12345678
-    አልተገኘም ከሆነ None ይመልሳል።"""
+    አልተገኘም ከሆነ None ይመልሳል፣ ካልሆነ ሙሉ URL (ለማምጣት ዝግጁ) ይመልሳል።"""
     raw = raw.strip()
 
-    m = re.search(r"apps\.cbe\.com\.et.*?[?&]id=([A-Za-z0-9]+)", raw, re.I)
+    m = re.search(r"https?://\S*\bcbe\.com\.et\S*", raw, re.I)
     if m:
-        return m.group(1).upper()
+        return m.group(0).rstrip(").,;]}\u2019\u201d\"'")
 
     parts = raw.split()
     if len(parts) == 2 and re.match(r"^FT[A-Za-z0-9]{6,}$", parts[0], re.I) and re.match(r"^\d{6,}$", parts[1]):
         ref, acct = parts[0].upper(), parts[1]
-        return ref + acct[-8:]
+        return f"https://apps.cbe.com.et:100/?id={ref}{acct[-8:]}"
 
     if len(parts) == 1 and re.match(r"^FT[A-Za-z0-9]{10,}$", parts[0], re.I):
-        return parts[0].upper()
+        return f"https://apps.cbe.com.et:100/?id={parts[0].upper()}"
 
     return None
+
 
 
 # ==========================================================================
@@ -209,9 +218,9 @@ async def handle_text(message: Message):
 
     # መጀመሪያ CBE ግቤት ስለመሆኑ እንፈትሻለን (ክፍተት ያለው reference+account ሊኖረው ስለሚችል
     # whitespace ከመፋቅ በፊት መፈተሽ አለበት)
-    cbe_id = _parse_cbe_input(raw)
-    if cbe_id:
-        await handle_cbe(message, cbe_id)
+    cbe_url = _parse_cbe_input(raw)
+    if cbe_url:
+        await handle_cbe(message, cbe_url)
         return
 
     tid = re.sub(r"\s+", "", raw)
@@ -293,41 +302,41 @@ async def handle_telebirr(message: Message, tid: str):
     await message.answer(text)
 
 
-async def handle_cbe(message: Message, cbe_id: str):
+async def handle_cbe(message: Message, cbe_url: str):
     processing = await message.answer("🔄 ደረሰኙን በማረጋገጥ ላይ ነኝ (CBE)...")
 
     try:
         loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, extract_cbe_receipt_data, cbe_id)
+        data = await loop.run_in_executor(None, extract_cbe_receipt_data, cbe_url)
     except requests.exceptions.Timeout:
         await processing.delete()
         await message.answer(
-            f"❌ *Timeout*: CBE ገጹ ምላሽ አልሰጠም።\nID: `{cbe_id}`"
+            f"❌ *Timeout*: CBE ገጹ ምላሽ አልሰጠም።\nLink: `{cbe_url}`"
         )
         return
     except requests.exceptions.ConnectionError as e:
         await processing.delete()
         await message.answer(
-            f"❌ *Connection Error*: ግንኙነት አልተሳካም።\nID: `{cbe_id}`\nError: `{e}`"
+            f"❌ *Connection Error*: ግንኙነት አልተሳካም።\nLink: `{cbe_url}`\nError: `{e}`"
         )
         return
     except requests.exceptions.HTTPError as e:
         await processing.delete()
         code = e.response.status_code if e.response is not None else "?"
-        await message.answer(f"❌ HTTP Error ({code}) — ID: `{cbe_id}`")
+        await message.answer(f"❌ HTTP Error ({code}) — Link: `{cbe_url}`")
         return
     except Exception as e:
         await processing.delete()
         logger.error(f"Unexpected CBE error: {e}")
-        await message.answer(f"❌ ያልታወቀ ስህተት: `{e}`\nID: `{cbe_id}`")
+        await message.answer(f"❌ ያልታወቀ ስህተት: `{e}`\nLink: `{cbe_url}`")
         return
 
     await processing.delete()
 
     if not data or not data.get("reference"):
         await message.answer(
-            f"⚠️ ደረሰኝ አልተገኘም (ID: `{cbe_id}`)።\n"
-            "Reference number እና የመለያ ቁጥር የመጨረሻ 8 አሃዝ ትክክል መሆናቸውን ያረጋግጡ።"
+            f"⚠️ ደረሰኝ አልተገኘም ወይም ማንበብ አልተቻለም።\nLink: `{cbe_url}`\n"
+            "Reference number እና የመለያ ቁጥር የመጨረሻ 8 አሃዝ (ወይም ሙሉ ሊንኩ) ትክክል መሆናቸውን ያረጋግጡ።"
         )
         return
 
@@ -344,7 +353,7 @@ async def handle_cbe(message: Message, cbe_id: str):
         f"⨳ የተላከው መጠን: {data.get('transferred_amount', '-')}\n"
         f"⨳ አጠቃላይ የተቀነሰ: {data.get('total_paid', '-')}\n"
         f"⨳ ቀን: {data.get('date', '-')}\n"
-        f"⨳ Reference: `{data.get('reference', cbe_id)}`\n"
+        f"⨳ Reference: `{data.get('reference', '-')}`\n"
         f"⨳ USER ID: `{message.from_user.id}`"
     )
     await message.answer(text)
